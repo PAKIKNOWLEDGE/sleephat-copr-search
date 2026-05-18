@@ -1,0 +1,316 @@
+#!/usr/bin/env python3
+"""
+copr-search — offline Copr project search
+
+Usage:
+    copr-search update         拉取/更新本地项目索引
+    copr-search <keyword>...   搜索项目（模糊匹配项目名、owner、描述）
+    copr-search --help         显示帮助
+
+数据来源：Copr API v3 (https://copr.fedorainfracloud.org/api_3/)
+"""
+
+import os
+import sys
+import json
+import sqlite3
+import argparse
+import time
+import urllib.request
+import urllib.error
+import shutil
+import concurrent.futures
+
+# ─── 配置 ──────────────────────────────────────────────
+API_BASE = "https://copr.fedorainfracloud.org/api_3"
+CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "copr-search")
+DB_PATH = os.path.join(CACHE_DIR, "projects.db")
+PAGE_SIZE = 100
+REQ_INTERVAL = 0.1
+TERM_WIDTH = shutil.get_terminal_size().columns if shutil.get_terminal_size else 80
+
+
+# ─── 进度条 ────────────────────────────────────────────
+
+class Progress:
+    def __init__(self, total: int, label: str = ""):
+        self.total = total
+        self.label = label
+        self.start = time.time()
+        self.current = 0
+
+    def update(self, n: int):
+        self.current += n
+        self._draw()
+
+    def set(self, n: int):
+        self.current = n
+        self._draw()
+
+    def done(self, msg: str = ""):
+        bar = "█" * 20
+        elapsed = time.time() - self.start
+        line = f"\r{self.label} [{bar}] 100% {self.current} 条 ({elapsed:.0f}s)"
+        if msg:
+            line += f"  {msg}"
+        print(line + " " * 10)
+
+    def _draw(self):
+        if self.total <= 0:
+            return
+        pct = self.current / self.total
+        bar_len = max(10, min(30, TERM_WIDTH - 40))
+        filled = int(bar_len * pct)
+        bar = "█" * filled + "░" * (bar_len - filled)
+        elapsed = time.time() - self.start
+        rate = self.current / elapsed if elapsed > 0 else 0
+        remaining = (self.total - self.current) / rate if rate > 0 else 0
+        sys.stdout.write(
+            f"\r{self.label} [{bar}] {pct*100:3.0f}%"
+            f"  {self.current:,} 条  {rate:.0f} 条/s"
+            f"  ETA {remaining:.0f}s"
+        )
+        sys.stdout.flush()
+
+
+# ─── 数据库 ────────────────────────────────────────────
+
+def ensure_cache():
+    os.makedirs(CACHE_DIR, exist_ok=True)
+
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA case_sensitive_like = OFF")
+    return conn
+
+
+def init_db(conn):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS projects (
+            id          INTEGER PRIMARY KEY,
+            full_name   TEXT NOT NULL,
+            ownername   TEXT NOT NULL,
+            name        TEXT NOT NULL,
+            description TEXT DEFAULT ''
+        )
+    """)
+    for col in ("full_name", "name", "ownername"):
+        conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{col} ON projects({col})")
+    conn.commit()
+
+
+# ─── API ──────────────────────────────────────────────
+
+def fetch_page(offset, retries=3):
+    """拉取一页，失败重试。返回 items list 或 []"""
+    url = f"{API_BASE}/project/list?limit={PAGE_SIZE}&offset={offset}"
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(url, timeout=30) as resp:
+                data = json.loads(resp.read().decode())
+            return data.get("items", [])
+        except (urllib.error.URLError, json.JSONDecodeError, OSError) as e:
+            if attempt < retries - 1:
+                time.sleep(1 * (attempt + 1))
+                continue
+            print(f"\n  ⚠ offset {offset} 请求失败 ({e})，跳过", file=sys.stderr)
+            return []
+
+
+def probe_last_offset() -> int:
+    """二分探测最后一个有数据的 offset，显示实时状态"""
+    lo, hi = 0, 50000  # 已知总量约 38K，从 50K 开始搜
+    step = 0
+    spinner = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        step += 1
+        ch = spinner[step % len(spinner)]
+        sys.stdout.write(f"\r  🔎 探测项目总数… {ch}  区间 [{lo:,} ~ {hi:,}] (第 {step} 步)")
+        sys.stdout.flush()
+        url = f"{API_BASE}/project/list?limit=1&offset={mid}"
+        try:
+            with urllib.request.urlopen(url, timeout=15) as resp:
+                data = json.loads(resp.read().decode())
+            empty = len(data.get("items", [])) == 0
+        except Exception:
+            empty = True
+        if empty:
+            hi = mid - 1
+        else:
+            lo = mid
+    sys.stdout.write(f"\r  🔎 探测完成 — 项目数约 {lo + 1:,}        \n")
+    sys.stdout.flush()
+    return lo
+
+
+# ─── 子命令：update ─────────────────────────────────────
+
+def cmd_update():
+    ensure_cache()
+    conn = get_db()
+    init_db(conn)
+
+    try:
+        # 记录已有 ID，用于清理已删除的项目
+        known_ids = set()
+        for row in conn.execute("SELECT id FROM projects"):
+            known_ids.add(row[0])
+        had_existing = len(known_ids) > 0
+
+        print("📡 Copr 项目索引更新")
+        if had_existing:
+            print(f"   已有 {len(known_ids)} 个项目，正在增量更新\n")
+        else:
+            print("   首次拉取，请稍候\n")
+
+        # ── 探测总量 ──
+        last_offset = probe_last_offset()
+        # probe 函数自己输出了完成行
+        total_pages = last_offset // PAGE_SIZE + 1
+        print(f"  估算约 {total_pages} 页 ({last_offset + 1:,} 个项目)\n")
+
+        # ── 多线程并发拉取 ──
+        pg = Progress(total_pages, "  📥")
+        WORKERS = 8
+
+        def fetch_and_store(page):
+            """拉取一页并返回 (page, items)"""
+            offset = page * PAGE_SIZE
+            items = fetch_page(offset)
+            return page, items
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as pool:
+            # 提交全部任务
+            fut_map = {pool.submit(fetch_and_store, p): p for p in range(total_pages)}
+
+            for fut in concurrent.futures.as_completed(fut_map):
+                page, items = fut.result()
+                if items:
+                    data = [
+                        (
+                            item["id"],
+                            item.get("full_name", ""),
+                            item.get("ownername", ""),
+                            item.get("name", ""),
+                            item.get("description", "") or "",
+                        )
+                        for item in items
+                    ]
+                    conn.executemany(
+                        "INSERT OR REPLACE INTO projects "
+                        "(id, full_name, ownername, name, description) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        data
+                    )
+                    conn.commit()
+
+                    for item in items:
+                        known_ids.discard(item["id"])
+
+                pg.update(1)
+
+        pg.done()
+        total = last_offset + 1
+
+        # ── 清理已删除 ──
+        if known_ids:
+            ids = list(known_ids)
+            batch_size = 500
+            for i in range(0, len(ids), batch_size):
+                batch = ids[i:i + batch_size]
+                conn.executemany(
+                    "DELETE FROM projects WHERE id = ?", [(x,) for x in batch]
+                )
+            conn.commit()
+            print(f"  🗑 清理了 {len(ids)} 个已删除的项目")
+
+        elapsed = time.time() - pg.start
+        print(f"\n✅ 完成！索引 {total:,} 个项目，用时 {elapsed:.0f}s")
+        print(f"   缓存: {DB_PATH}")
+
+    except KeyboardInterrupt:
+        print("\n\n⏹  已中断。已有数据已写入，下次运行继续增量更新。")
+    finally:
+        conn.close()
+
+
+# ─── 子命令：search ────────────────────────────────────
+
+def cmd_search(keywords):
+    ensure_cache()
+    if not os.path.exists(DB_PATH):
+        print("❌ 本地索引不存在，请先运行: copr-search update", file=sys.stderr)
+        sys.exit(1)
+
+    conn = get_db()
+    query = " ".join(keywords)
+    pat = f"%{query}%"
+
+    rows = conn.execute(
+        """
+        SELECT full_name, ownername, name, description
+        FROM projects
+        WHERE full_name LIKE ?
+           OR ownername LIKE ?
+           OR name LIKE ?
+           OR description LIKE ?
+        ORDER BY
+            CASE
+                WHEN name LIKE ? THEN 0
+                WHEN full_name LIKE ? THEN 1
+                WHEN ownername LIKE ? THEN 2
+                ELSE 3
+            END
+        LIMIT 30
+        """,
+        (pat,) * 7
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        print(f"😕 没有找到匹配「{query}」的项目")
+        print("  提示：匹配项目名、owner、描述，试试更短的关键词")
+        return
+
+    print(f"🔍 找到 {len(rows)} 个匹配「{query}」的项目:\n")
+    for full, owner, name, desc in rows:
+        short_desc = (desc[:80] + "…") if len(desc) > 80 else desc
+        if "\n" in short_desc:
+            short_desc = short_desc.split("\n")[0] + "…"
+        print(f"  📦 {full}")
+        print(f"     启用: sudo dnf copr enable {full}")
+        if short_desc:
+            print(f"     描述: {short_desc}")
+        print()
+
+
+# ─── CLI ──────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="🔍 Copr 项目搜索 — 离线索引，国内直连，模糊匹配",
+        epilog="示例:\n"
+               "  copr-search update           首次拉取全部项目索引\n"
+               "  copr-search sarasa            搜索项目\n"
+               "  copr-search nerd font         多词搜索\n",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("keyword", nargs="*", help="搜索关键词，或子命令 update")
+    args = parser.parse_args()
+
+    if not args.keyword:
+        parser.print_help()
+        return
+
+    if args.keyword[0] == "update":
+        cmd_update()
+    elif args.keyword[0] in ("--help", "-h"):
+        parser.print_help()
+    else:
+        cmd_search(args.keyword)
+
+
+if __name__ == "__main__":
+    main()
